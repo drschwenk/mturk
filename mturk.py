@@ -3,6 +3,7 @@ import boto3
 import pickle
 import copy
 import logging
+import queue
 import xmltodict
 from tqdm import tqdm
 import datetime
@@ -48,8 +49,13 @@ class MturkClient:
         :param **kwargs any other parameters needed for a specific HIT type
         :return the created HIT object
         """
-        response = self.client.create_hit(**kwargs)
-        return response
+        try:
+            print(self.client)
+            response = self.client.create_hit(**kwargs)
+            return response
+        except ClientError as e:
+            print(e)
+            return None
 
 
 class MTurk:
@@ -99,8 +105,9 @@ class MTurk:
         # )
         self.kwargs = kwargs
         self.amt = MturkClient(**self.kwargs)
-        self.n_threads = 4
+        self.n_threads = kwargs['n_threads']
         self.in_sandbox = kwargs['in_sandbox']
+        self.s3_base_path = kwargs['s3_base_path']
         self.turk_data_schemas = {
             'html': 'http://mechanicalturk.amazonaws.com/AWSMechanicalTurkDataSchemas/2011-11-11/HTMLQuestion.xsd'
         }
@@ -152,8 +159,6 @@ class MTurk:
         }
         return [high_accept_rate]
 
-
-
     @classmethod
     def _render_hit_html(cls, template_params, **kwargs):
         env = jinja2.Environment(loader=jinja2.FileSystemLoader(template_params['template_dir']))
@@ -201,12 +206,15 @@ class MTurk:
         return hit_params
 
     def create_hit_group(self, data, task_param_generator, **kwargs):
-        hit_params = [self.create_html_hit_params(**kwargs, **task_param_generator(point)) for point in data]
+        hit_params = [self.create_html_hit_params(**kwargs, **task_param_generator(point, self.s3_base_path)) for point in data]
         hit_batches = [hit_params[i::self.n_threads] for i in range(self.n_threads)]
         print(len(hit_batches))
+        _ = [print(len(b)) for b in hit_batches]
         threads = []
+        res_queue = queue.Queue()
+
         for batch in hit_batches:
-            t = CreateHits(batch, **self.kwargs)
+            t = CreateHits(batch, res_queue, **self.kwargs)
             threads.append(t)
 
         for thread in threads:
@@ -214,6 +222,12 @@ class MTurk:
 
         for thread in threads:
             thread.join()
+
+        result_list = []
+        while not res_queue.empty():
+            result_list.append(res_queue.get())
+
+        return [item for sl in result_list for item in sl]
 
     def get_all_hits(self):
         paginator = self.amt.client.get_paginator('list_hits')
@@ -233,10 +247,21 @@ class MTurk:
         for batch in hit_batches:
             t = ExpireHits(batch, **self.kwargs)
             threads.append(t)
-            t.start()
+
+        for thread in threads:
+            thread.start()
+
+        for thread in threads:
+            thread.join()
 
     def delete_hits(self, hits):
-        responses = [self.amt.client.delete_hit(HITId=h['HITId']) for h in tqdm(hits) if h['HITStatus'] != 'Disposed']
+        responses = []
+        for h in hits:
+            if h['HITStatus'] != 'Disposed':
+                try:
+                    self.amt.client.delete_hit(HITId=h['HITId'])
+                except ClientError as e:
+                    print(e)
 
     def force_delete_hits(self, hits):
         self.expire_hits(hits)
@@ -288,17 +313,18 @@ class ExpireHits(BotoThreadedOperation):
 
     def run(self):
         responses = [self.amt.client.update_expiration_for_hit(HITId=h['HITId'], ExpireAt=self.exp_date)
-                     for h in tqdm(self.hits)]
+                     for h in self.hits]
 
 
 class CreateHits(BotoThreadedOperation):
-    def __init__(self, batch, **kwargs):
+    def __init__(self, batch, target_queue, **kwargs):
         super().__init__(**kwargs)
         self.batch = batch
+        self._queue = target_queue
 
     def run(self):
         responses = [self.amt.create_hit(**point) for point in self.batch]
-        return responses
+        self._queue.put(responses)
 
 
 class HITGroup:
