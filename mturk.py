@@ -5,7 +5,9 @@ import copy
 import logging
 import queue
 import xmltodict
+import pickle
 from tqdm import tqdm
+import time
 import datetime
 import threading
 import jinja2
@@ -40,7 +42,7 @@ class MturkClient:
             aws_access_key_id=kwargs['aws_access_key_id'],
             aws_secret_access_key=kwargs['aws_secret_access_key']
         )
-        print(self.client)
+        # print(self.client)
 
     def create_hit(self, **kwargs):
         """
@@ -50,7 +52,7 @@ class MturkClient:
         :return the created HIT object
         """
         try:
-            print(self.client)
+            # print(self.client)
             response = self.client.create_hit(**kwargs)
             return response
         except ClientError as e:
@@ -139,6 +141,8 @@ class MTurk:
         print(f'Account balance is: ${balance:.{2}f}')
 
     def _build_qualifications(self, locales=None):
+        if locales:
+            locales = [{'Country': loc} for loc in locales]
         masters_id = '2ARFPLSP75KLA8M8DH1HTEQVJT3SY6' if self.in_sandbox else '2F1QJWKUDD8XADTFD2Q0G6UTO95ALH'
         master = {
             'QualificationTypeId': masters_id,
@@ -153,11 +157,11 @@ class MTurk:
         }
         location_based = {
             'QualificationTypeId': '00000000000000000071',
-            'Comparator': 'in',
-            'LocaleValue': locales,
+            'Comparator': 'In',
+            'LocaleValues': locales,
             'RequiredToPreview': True,
         }
-        return [high_accept_rate]
+        return [high_accept_rate, location_based]
 
     @classmethod
     def _render_hit_html(cls, template_params, **kwargs):
@@ -165,6 +169,18 @@ class MTurk:
         template = env.get_template(template_params['template_file'])
         hit_html = template.render(**kwargs)
         return hit_html
+
+    @classmethod
+    def pickle_this(cls, this, filename='temp', protocol=pickle.HIGHEST_PROTOCOL):
+        filename = '_'.join([filename] + time.asctime().lower().replace(':', '_').split()) + '.pkl'
+        with open(filename, 'wb') as f:
+            pickle.dump(this, f, protocol=protocol)
+
+    @classmethod
+    def unpickle_this(cls, filename):
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
+        return
 
     def preview_hit_interface(self, template_params, **kwargs):
         hit_html = self._render_hit_html(template_params, **kwargs)
@@ -202,14 +218,16 @@ class MTurk:
         frame_height = hit_params.pop('frame_height')
         question_html = self._render_hit_html(template_params, **kwargs)
         hit_params['Question'] = self._create_question_xml(question_html, frame_height)
-        hit_params['QualificationRequirements'] = self._build_qualifications()
+        hit_params['QualificationRequirements'] = self._build_qualifications(self.qualifications['english_speaking'])
         return hit_params
 
     def create_hit_group(self, data, task_param_generator, **kwargs):
+        if not self.expected_cost(data, **kwargs):
+            return None
         hit_params = [self.create_html_hit_params(**kwargs, **task_param_generator(point, self.s3_base_path)) for point in data]
         hit_batches = [hit_params[i::self.n_threads] for i in range(self.n_threads)]
-        print(len(hit_batches))
-        _ = [print(len(b)) for b in hit_batches]
+        # print(len(hit_batches))
+        # _ = [print(len(b)) for b in hit_batches]
         threads = []
         res_queue = queue.Queue()
 
@@ -227,7 +245,21 @@ class MTurk:
         while not res_queue.empty():
             result_list.append(res_queue.get())
 
-        return [item for sl in result_list for item in sl]
+        hits_created = [item for sl in result_list for item in sl]
+        self.pickle_this(hits_created, f'submitted_batch_{len(hits_created)}')
+        return hits_created
+
+    def expected_cost(self, data, **kwargs):
+        hit_params = kwargs['basic_hit_params']
+        cost = len(data) * float(hit_params['Reward']) * hit_params['MaxAssignments']
+        cost_plus_fee = cost * 1.2
+        current_balance = self.get_num_balance()
+        if cost_plus_fee > current_balance:
+            print(f'Insufficient funds: will cost ${cost_plus_fee:.{2}f} but only ${current_balance:.{2}f} available.')
+            return
+        else:
+            print(f'Batch will cost ${cost_plus_fee:.{2}f}')
+            return cost_plus_fee
 
     def get_all_hits(self):
         paginator = self.amt.client.get_paginator('list_hits')
@@ -268,7 +300,7 @@ class MTurk:
         self.delete_hits(hits)
 
     def set_hits_reviewing(self, hits):
-        responses = [self.client.update_hit_review_status(HITId=h['HITId'], Revert=False) for h in hits]
+        responses = [self.amt.client.update_hit_review_status(HITId=h['HITId'], Revert=False) for h in hits]
 
     def revert_hits_reviewable(self, hits):
         responses = [self.client.update_hit_review_status(HITId=h['HITId'], Revert=True) for h in hits]
@@ -278,7 +310,7 @@ class MTurk:
         if not hits:
             hits = self.get_all_hits()
         for hit in hits:
-            assignments.append(self.client.list_assignments_for_hit(
+            assignments.append(self.amt.client.list_assignments_for_hit(
                 HITId=hit['HITId'],
                 AssignmentStatuses=['Submitted', 'Approved'],
                 MaxResults=10)
@@ -291,7 +323,7 @@ class MTurk:
                 if assignment['AssignmentStatus'] == 'Submitted':
                     assignment_id = assignment['AssignmentId']
                     print('Approving Assignment {}'.format(assignment_id))
-                    self.client.approve_assignment(
+                    self.amt.client.approve_assignment(
                         AssignmentId=assignment_id,
                         RequesterFeedback='good',
                         OverrideRejection=False,
